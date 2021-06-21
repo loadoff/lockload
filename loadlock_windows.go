@@ -77,6 +77,9 @@ func InitLock(name string) (*LockHandle, error) {
 
 // Lock ロックを開始
 func (lock *LockHandle) Lock(timeout int) error {
+	if lock.isLocked {
+		lock.Unlock()
+	}
 	handle, _, _ := waitForSingleObject.Call(lock.mutex, uintptr(timeout))
 	if int(handle) == waitObject0 || int(handle) == waitAbandoned {
 		// Lock成功
