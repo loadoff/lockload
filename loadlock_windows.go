@@ -6,50 +6,26 @@ package lockload
 import (
 	"errors"
 	"fmt"
+	"runtime"
+	"sync"
 	"syscall"
-	"unsafe"
+
+	"golang.org/x/sys/windows"
 )
 
 // LockHandle ミューテックスハンドルを保持する。
 type LockHandle struct {
-	mutex    uintptr
-	isLocked bool
+	handle      windows.Handle
+	mutexHandle windows.Handle
+	name        *uint16
+	mu          sync.Mutex
 }
-
-// DLLハンドル
-type dllHandle struct {
-	dll *syscall.DLL
-}
-
-var (
-	kernel32Dll         = loadDLL("kernel32.dll")
-	createMutexW        = kernel32Dll.findProc("CreateMutexW")
-	waitForSingleObject = kernel32Dll.findProc("WaitForSingleObject")
-	releaseMutex        = kernel32Dll.findProc("ReleaseMutex")
-	closeHandle         = kernel32Dll.findProc("CloseHandle")
-)
 
 const (
 	waitObject0   int = 0
 	waitAbandoned int = 128
 	waitTimeout   int = 258
 )
-
-func loadDLL(name string) *dllHandle {
-	dll, err := syscall.LoadDLL(name)
-	if err != nil {
-		panic(err)
-	}
-	return &dllHandle{dll: dll}
-}
-
-func (handle *dllHandle) findProc(name string) *syscall.Proc {
-	proc, err := handle.dll.FindProc(name)
-	if err != nil {
-		panic(err)
-	}
-	return proc
-}
 
 var (
 	// ErrBusy ビジー状態エラー
@@ -65,59 +41,65 @@ func InitLock(name string) (*LockHandle, error) {
 	if name == "" {
 		return nil, ErrInvalidLockName
 	}
-	mutexName := fmt.Sprintf("Global\\%s", name)
-	mutex, _, _ := createMutexW.Call(
-		0, 0, uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr(mutexName))))
-	if mutex == 0 {
-		err := syscall.GetLastError()
-		return nil, err
-	}
-	return &LockHandle{mutex: mutex, isLocked: false}, nil
+	mutexName := syscall.StringToUTF16Ptr(fmt.Sprintf("Global\\%s", name))
+	//handle, err := windows.CreateMutex(nil, false, mutexName)
+	/*if err != nil {
+		handle = 0
+	}*/
+	return &LockHandle{name: mutexName, handle: 0, mutexHandle: 0}, nil
 }
 
 // Lock ロックを開始
-func (lock *LockHandle) Lock(timeout int) error {
-	if lock.isLocked {
-		lock.Unlock()
+func (lock *LockHandle) Lock() error {
+	runtime.LockOSThread()
+	lock.mu.Lock()
+	handle, err := windows.OpenMutex(windows.MUTEX_ALL_ACCESS, false, lock.name)
+	if err != nil {
+		if err.Error() != "The system cannot find the file specified." {
+			fmt.Println(err)
+			return err
+		}
+		lock.mutexHandle, err = windows.CreateMutex(nil, false, lock.name)
+		if err != nil {
+			fmt.Println(err)
+			return err
+		}
+		handle, err = windows.OpenMutex(windows.MUTEX_ALL_ACCESS, false, lock.name)
+		if err != nil {
+			fmt.Println(err)
+			return err
+		}
 	}
-	handle, _, _ := waitForSingleObject.Call(lock.mutex, uintptr(timeout))
-	if int(handle) == waitObject0 || int(handle) == waitAbandoned {
-		// Lock成功
-		lock.isLocked = true
+	event, err := windows.WaitForSingleObject(handle, 500)
+	if int(event) == waitObject0 || int(event) == waitAbandoned {
+		lock.handle = handle
 		return nil
-	} else if int(handle) == waitTimeout {
-		return ErrBusy
 	}
-	return fmt.Errorf("Unknown Error. [%v]", syscall.GetLastError())
+	fmt.Println(err)
+	return ErrBusy
 }
 
 // Unlock ロックを解除
 func (lock *LockHandle) Unlock() error {
-	if !lock.isLocked {
-		return nil
+	defer func() {
+		lock.mu.Unlock()
+		runtime.UnlockOSThread()
+	}()
+	err1 := windows.ReleaseMutex(lock.handle)
+	err2 := windows.CloseHandle(lock.handle)
+	if err1 != nil {
+		fmt.Println(err1)
+		return err1
 	}
-	handle, _, _ := releaseMutex.Call(lock.mutex)
-	if int(handle) == 0 { // 失敗
-		return fmt.Errorf("Unlock Error. [%v]", syscall.GetLastError())
+	if err2 != nil {
+		fmt.Println(err2)
+		return err2
 	}
-	lock.isLocked = false
 	return nil
 }
 
-// IsLocked 自プロセスがロックしているかの確認
-func (lock *LockHandle) IsLocked() bool {
-	isLocked := false
-	handle, _, _ := waitForSingleObject.Call(lock.mutex, 0)
-	if int(handle) == waitObject0 || int(handle) == waitAbandoned {
-		isLocked = lock.isLocked
-		releaseMutex.Call(lock.mutex)
-		return isLocked
+func (lock *LockHandle) Term() {
+	if lock.mutexHandle != 0 {
+		windows.CloseHandle(lock.mutexHandle)
 	}
-	return isLocked
-}
-
-// TermLock ミューテックスを破棄
-func (lock *LockHandle) TermLock() error {
-	closeHandle.Call(lock.mutex)
-	return nil
 }
